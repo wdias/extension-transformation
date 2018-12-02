@@ -54,8 +54,8 @@ type Point struct {
 	Value float64 `json:"value"`
 }
 
-// InputVariable : InputVariable
-type InputVariable struct {
+// DataVariable : DataVariable
+type DataVariable struct {
 	Variable
 	Data []Point `json:"data"`
 }
@@ -65,9 +65,16 @@ type FunctionParams struct {
 	ExtensionID     string          `json:"extensionId"`
 	Extension       string          `json:"extension"`
 	Function        string          `json:"function"`
-	InputVariables  []InputVariable `json:"inputVariables"`
+	InputVariables  []DataVariable  `json:"inputVariables"`
 	OutputVariables []Variable      `json:"outputVariables"`
 	Options         json.RawMessage `json:"options"`
+	Callback        string          `json:"callback"`
+}
+
+// FunctionResponse : Function response
+type FunctionResponse struct {
+	OutputVariables []DataVariable `json:"outputVariables"` // NOTE: Need to be at top
+	FunctionParams
 }
 
 func getVariableByIDs(variableList []Variable, variableIDs []string) (variables []Variable) {
@@ -100,15 +107,34 @@ func getDataPoints(variable Variable) (points []Point, err error) {
 	return
 }
 
+func saveDataPoints(variable DataVariable) (err error) {
+	fmt.Println("SaveDataPoints:", variable)
+	adapterHost := fmt.Sprint("http://adapter-", strings.ToLower(variable.Timeseries.ValueType), ".default.svc.cluster.local")
+	jsonValue, _ := json.Marshal(variable.Data)
+	response, err := netClient.Post(fmt.Sprint(adapterHost, "/timeseries/", variable.Timeseries.TimeseriesID), "application/json", bytes.NewBuffer(jsonValue))
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	_, err = ioutil.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != 200 {
+		return fmt.Errorf("Unable to find Timeseries for save data: %q", variable.Timeseries.TimeseriesID)
+	}
+	return
+}
+
 func getFunctionParams(extension *Extension) (functionParams *FunctionParams, err error) {
 	var inputVariables = getVariableByIDs(extension.Data.Variables, extension.Data.InputVariables)
-	var inputVariablesWithData []InputVariable
+	var inputVariablesWithData []DataVariable
 	for _, inputVariable := range inputVariables {
 		points, err := getDataPoints(inputVariable)
 		if err != nil {
 			return nil, fmt.Errorf("Unable to get data for Timeseries: %q", inputVariable.Timeseries.TimeseriesID)
 		}
-		var inputVariableWithData InputVariable
+		var inputVariableWithData DataVariable
 		inputVariableWithData.VariableID = inputVariable.VariableID
 		inputVariableWithData.Timeseries = inputVariable.Timeseries
 		inputVariableWithData.Data = points
@@ -123,12 +149,14 @@ func getFunctionParams(extension *Extension) (functionParams *FunctionParams, er
 	functionParams.InputVariables = inputVariablesWithData
 	functionParams.OutputVariables = outputVariables
 	functionParams.Options = extension.Options
+	functionParams.Callback = "http://extension-transformation.default.svc.cluster.local/extension/transformation/callback"
 	return
 }
 
 func triggerFunction(functionParams *FunctionParams) (err error) {
 	transformationHost := fmt.Sprint("http://transformation-", functionMap[functionParams.Function], ".default.svc.cluster.local")
-	transformationURL := fmt.Sprint(transformationHost, "/extension/transformation/", functionMap[functionParams.Function])
+	urlQuery := fmt.Sprint("?token=", 123, "&start=", "2017-09-15T00:00:00", "&end=", "2017-09-15T03:00:00")
+	transformationURL := fmt.Sprint(transformationHost, "/extension/transformation/", functionMap[functionParams.Function], urlQuery)
 	fmt.Println("Trigger function:", transformationURL, functionParams)
 	jsonValue, _ := json.Marshal(functionParams)
 	response, err := netClient.Post(transformationURL, "application/json", bytes.NewBuffer(jsonValue))
@@ -164,7 +192,7 @@ func main() {
 	app := iris.Default()
 	app.Post("/extension/transformation/trigger/{extensionID:string}", func(ctx iris.Context) {
 		extensionID := ctx.Params().Get("extensionID")
-		fmt.Println("extensionID:", extensionID)
+		fmt.Println("Trigger ExtensionID:", extensionID)
 		extension := &Extension{}
 		err := ctx.ReadJSON(extension)
 		if err != nil {
@@ -182,6 +210,28 @@ func main() {
 		if err != nil {
 			ctx.JSON(context.Map{"response": err.Error()})
 			return
+		}
+		ctx.JSON(iris.Map{
+			"message": "OK",
+		})
+	})
+
+	app.Post("/extension/transformation/callback/{token:string}", func(ctx iris.Context) {
+		token := ctx.Params().Get("token")
+		fmt.Println("Trigger Callback Token:", token)
+		funcResp := &FunctionResponse{}
+		err := ctx.ReadJSON(funcResp)
+		if err != nil {
+			ctx.JSON(context.Map{"response": err.Error()})
+			return
+		}
+		fmt.Println("FunctionResponse:", funcResp)
+		for _, outputVariable := range funcResp.OutputVariables {
+			err := saveDataPoints(outputVariable)
+			if err != nil {
+				ctx.JSON(context.Map{"response": err.Error()})
+				return
+			}
 		}
 		ctx.JSON(iris.Map{
 			"message": "OK",
