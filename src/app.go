@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -77,6 +78,10 @@ type FunctionResponse struct {
 	FunctionParams
 }
 
+func generateToken() string {
+	return fmt.Sprintf("T%08d", rand.Intn(100000000))
+}
+
 func getVariableByIDs(variableList []Variable, variableIDs []string) (variables []Variable) {
 	for _, variableID := range variableIDs {
 		for _, variable := range variableList {
@@ -88,10 +93,10 @@ func getVariableByIDs(variableList []Variable, variableIDs []string) (variables 
 	return
 }
 
-func getDataPoints(variable Variable) (points []Point, err error) {
-	fmt.Println("GetDataPoints:", variable)
+func getDataPoints(variable Variable, queryOptions string) (points []Point, err error) {
+	fmt.Println("GetDataPoints:", variable, queryOptions)
 	adapterHost := fmt.Sprint("http://adapter-", strings.ToLower(variable.Timeseries.ValueType), ".default.svc.cluster.local")
-	response, err := netClient.Get(fmt.Sprint(adapterHost, "/timeseries/", variable.Timeseries.TimeseriesID))
+	response, err := netClient.Get(fmt.Sprint(adapterHost, "/timeseries/", variable.Timeseries.TimeseriesID, "?", queryOptions))
 	if err != nil {
 		return nil, err
 	}
@@ -101,6 +106,7 @@ func getDataPoints(variable Variable) (points []Point, err error) {
 		return nil, err
 	}
 	if response.StatusCode != 200 {
+		fmt.Println("GetDataPoints Unable to find Timeseries:", string(body))
 		return nil, fmt.Errorf("Unable to find Timeseries: %q", variable.Timeseries.TimeseriesID)
 	}
 	err = json.Unmarshal(body, &points)
@@ -126,11 +132,11 @@ func saveDataPoints(variable DataVariable) (err error) {
 	return
 }
 
-func getFunctionParams(extension *Extension) (functionParams *FunctionParams, err error) {
+func getFunctionParams(extension *Extension, queryOptions string) (functionParams *FunctionParams, err error) {
 	var inputVariables = getVariableByIDs(extension.Data.Variables, extension.Data.InputVariables)
 	var inputVariablesWithData []DataVariable
 	for _, inputVariable := range inputVariables {
-		points, err := getDataPoints(inputVariable)
+		points, err := getDataPoints(inputVariable, queryOptions)
 		if err != nil {
 			return nil, fmt.Errorf("Unable to get data for Timeseries: %q", inputVariable.Timeseries.TimeseriesID)
 		}
@@ -153,9 +159,9 @@ func getFunctionParams(extension *Extension) (functionParams *FunctionParams, er
 	return
 }
 
-func triggerFunction(functionParams *FunctionParams) (err error) {
+func triggerFunction(functionParams *FunctionParams, token string, queryOptions string) (err error) {
 	transformationHost := fmt.Sprint("http://transformation-", functionMap[functionParams.Function], ".default.svc.cluster.local")
-	urlQuery := fmt.Sprint("?token=", 123, "&start=", "2017-09-15T00:00:00", "&end=", "2017-09-15T03:00:00")
+	urlQuery := fmt.Sprint("?token=", token, "&", queryOptions)
 	transformationURL := fmt.Sprint(transformationHost, "/extension/transformation/", functionMap[functionParams.Function], urlQuery)
 	fmt.Println("Trigger function:", transformationURL, functionParams)
 	jsonValue, _ := json.Marshal(functionParams)
@@ -164,11 +170,12 @@ func triggerFunction(functionParams *FunctionParams) (err error) {
 		return err
 	}
 	defer response.Body.Close()
-	// body, err := ioutil.ReadAll(response.Body)
+	body, err := ioutil.ReadAll(response.Body)
 	if err != nil {
 		return err
 	}
 	if response.StatusCode != 200 {
+		fmt.Println("Unable to trigger Extension: ", string(body))
 		return fmt.Errorf("Unable to trigger Extension: %q-%q", functionParams.Extension, functionMap[functionParams.Function])
 	}
 	return nil
@@ -199,14 +206,16 @@ func main() {
 			ctx.JSON(context.Map{"response": err.Error()})
 			return
 		}
+		queryOptions := ctx.Request().URL.RawQuery
+		token := generateToken()
 		fmt.Println("Extension:", extension)
-		funcParams, err := getFunctionParams(extension)
+		funcParams, err := getFunctionParams(extension, queryOptions)
 		if err != nil {
 			ctx.JSON(context.Map{"response": err.Error()})
 			return
 		}
 		fmt.Println("FunctionParams:", funcParams)
-		err = triggerFunction(funcParams)
+		err = triggerFunction(funcParams, token, queryOptions)
 		if err != nil {
 			ctx.JSON(context.Map{"response": err.Error()})
 			return
